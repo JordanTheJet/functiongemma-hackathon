@@ -507,17 +507,30 @@ def _generate_cloud_inner(messages, tools):
     }
 
 
-def _heuristic_extract(messages, tools):
-    """Regex-based parameter extraction fallback when FunctionGemma fails entirely.
+_HEURISTIC_KEYWORDS = {
+    "send_message": {"text", "message", "send", "tell", "saying", "say"},
+    "get_weather": {"weather", "temperature", "forecast", "climate"},
+    "set_alarm": {"alarm", "wake"},
+    "set_timer": {"timer", "countdown"},
+    "play_music": {"play", "music", "song", "listen"},
+    "create_reminder": {"remind", "reminder"},
+    "search_contacts": {"find", "look", "search", "contact", "contacts"},
+}
 
-    Only used for single-tool scenarios where we KNOW which function to call
-    but the model refuses. Extracts values from the user message using patterns.
-    """
-    if len(tools) != 1:
-        return None
 
-    tool = tools[0]
-    user_msg = " ".join(m["content"] for m in messages if m["role"] == "user")
+def _heuristic_tool_score(segment, tool):
+    """Score how relevant a tool is to a segment using keyword aliases."""
+    score = _tool_relevance_score(segment, tool)
+    seg_lower = segment.lower()
+    keywords = _HEURISTIC_KEYWORDS.get(tool["name"], set())
+    for kw in keywords:
+        if kw in seg_lower:
+            score += 3
+    return score
+
+
+def _heuristic_extract_for_tool(user_msg, tool):
+    """Extract parameters for a specific tool from a user message segment."""
     msg_lower = user_msg.lower()
     props = tool["parameters"].get("properties", {})
     required = tool["parameters"].get("required", [])
@@ -528,10 +541,8 @@ def _heuristic_extract(messages, tools):
         desc = pinfo.get("description", "").lower()
 
         if ptype == "integer":
-            # Extract numbers from user message
             nums = re.findall(r'\b(\d+)\b', user_msg)
             if "hour" in param.lower():
-                # Try to parse time patterns: "6 AM", "10:15 PM", "3 PM"
                 time_match = re.search(r'(\d{1,2})(?::(\d{2}))?\s*(am|pm|AM|PM)', user_msg)
                 if time_match:
                     h = int(time_match.group(1))
@@ -544,17 +555,23 @@ def _heuristic_extract(messages, tools):
                 elif nums:
                     args[param] = int(nums[0])
             elif "minute" in param.lower():
-                time_match = re.search(r'(\d{1,2}):(\d{2})', user_msg)
-                if time_match:
-                    args[param] = int(time_match.group(2))
+                # Check for duration pattern "N minute(s)" first
+                dur_match = re.search(r'(\d+)\s*minute', msg_lower)
+                if dur_match:
+                    args[param] = int(dur_match.group(1))
                 else:
-                    args[param] = 0  # Default to 0 for whole-hour times
+                    time_match = re.search(r'(\d{1,2}):(\d{2})', user_msg)
+                    if time_match:
+                        args[param] = int(time_match.group(2))
+                    else:
+                        args[param] = 0
             elif nums:
                 args[param] = int(nums[0])
 
         elif ptype == "string":
-            if "recipient" in desc:
-                # For recipient, look after "to" before "saying/say"
+            pl = param.lower()
+            # Use param name as primary discriminator to avoid desc keyword collisions
+            if pl in ("recipient",) or ("recipient" in desc and "person" in desc):
                 recip_match = re.search(r'(?:to|text|message)\s+([A-Z][a-z]+)', user_msg)
                 if recip_match:
                     args[param] = recip_match.group(1)
@@ -566,8 +583,33 @@ def _heuristic_extract(messages, tools):
                     names = [n for n in names if n not in stop_names]
                     if names:
                         args[param] = names[0]
-            elif "name" in desc or "query" in desc:
-                # Extract capitalized names
+            elif pl in ("song",) or ("song" in desc or "artist" in desc or "playlist" in desc):
+                play_match = re.search(r'play\s+(?:some\s+|the\s+)?(.+?)(?:\s+and\s|\s*,\s*|\.|$)', msg_lower)
+                if play_match:
+                    args[param] = play_match.group(1).strip()
+            elif pl in ("location",) or ("location" in desc or "city" in desc):
+                loc_match = re.search(r'(?:in|for|of)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)', user_msg)
+                if loc_match:
+                    args[param] = loc_match.group(1)
+            elif pl in ("title",) or ("title" in desc and "message" not in pl):
+                title_match = re.search(r'(?:remind\s+me\s+(?:to\s+|about\s+)?|reminder\s+(?:to\s+|for\s+)?)(.+?)(?:\s+at\s+|\s+by\s+|\s+and\s|\s*,\s*|\.|$)', msg_lower)
+                if title_match:
+                    title = title_match.group(1).strip()
+                    title = re.sub(r'^(?:the|a|an)\s+', '', title)
+                    args[param] = title
+            elif pl in ("time",) or ("time" in desc and pl not in ("message", "title")):
+                time_match = re.search(r'(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))', user_msg)
+                if time_match:
+                    args[param] = time_match.group(1)
+            elif pl in ("message",) or ("content" in desc):
+                msg_match = re.search(r'(?:saying|say|that says)\s+(.+?)(?:\s+and\s|\s*,\s*|\.|!|\?|$)', user_msg, re.IGNORECASE)
+                if msg_match:
+                    args[param] = msg_match.group(1).strip()
+                else:
+                    msg_match2 = re.search(r'message\s+(.+?)(?:\s+and\s|\s*,\s*|\.|!|\?|$)', user_msg, re.IGNORECASE)
+                    if msg_match2:
+                        args[param] = msg_match2.group(1).strip()
+            elif pl in ("query",) or ("name" in desc and pl not in ("message", "song")):
                 names = re.findall(r'\b([A-Z][a-z]+)\b', user_msg)
                 stop_names = {"Set", "Get", "Send", "Play", "Find", "Search",
                               "Look", "Check", "Wake", "Remind", "Text",
@@ -575,47 +617,81 @@ def _heuristic_extract(messages, tools):
                 names = [n for n in names if n not in stop_names]
                 if names:
                     args[param] = names[0]
-            elif "song" in desc or "artist" in desc or "music" in desc:
-                # Extract song/artist — everything between "play" and end
-                play_match = re.search(r'play\s+(?:some\s+|the\s+)?(.+?)(?:\.|$)', msg_lower)
-                if play_match:
-                    args[param] = play_match.group(1).strip()
-            elif "location" in desc or "city" in desc:
-                # Extract location — often after "in" or "for"
-                loc_match = re.search(r'(?:in|for|of)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)', user_msg)
-                if loc_match:
-                    args[param] = loc_match.group(1)
-            elif "title" in desc:
-                # Extract reminder/event title
-                title_match = re.search(r'(?:remind\s+me\s+(?:to\s+|about\s+)?|reminder\s+(?:to\s+|for\s+)?)(.+?)(?:\s+at\s+|\s+by\s+|\.|$)', msg_lower)
-                if title_match:
-                    title = title_match.group(1).strip()
-                    # Strip leading articles
-                    title = re.sub(r'^(?:the|a|an)\s+', '', title)
-                    args[param] = title
-            elif "time" in desc:
-                time_match = re.search(r'(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))', user_msg)
-                if time_match:
-                    args[param] = time_match.group(1)
-            elif "message" in desc or "content" in desc:
-                # Extract message content — after "saying" or "that says"
-                # Use original case for proper nouns
-                msg_match = re.search(r'(?:saying|say|that says)\s+(.+?)(?:\.|!|\?|$)', user_msg, re.IGNORECASE)
-                if msg_match:
-                    args[param] = msg_match.group(1).strip()
-                else:
-                    # Fallback: content after "message" keyword
-                    msg_match2 = re.search(r'message\s+(.+?)(?:\.|!|\?|$)', user_msg, re.IGNORECASE)
-                    if msg_match2:
-                        args[param] = msg_match2.group(1).strip()
 
-    # Validate all required params are present
     for req in required:
         if req not in args or args[req] is None or (isinstance(args[req], str) and not args[req]):
             return None
 
+    return {"name": tool["name"], "arguments": args}
+
+
+def _heuristic_extract(messages, tools):
+    """Regex-based parameter extraction fallback when FunctionGemma fails entirely.
+
+    Uses keyword aliases for better tool matching. Handles single-tool and
+    multi-tool (pick best match) scenarios.
+    """
+    user_msg = " ".join(m["content"] for m in messages if m["role"] == "user")
+    if len(tools) == 1:
+        tool = tools[0]
+    else:
+        scored = [(t, _heuristic_tool_score(user_msg, t)) for t in tools]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        if scored[0][1] <= 0:
+            return None
+        tool = scored[0][0]
+
+    call = _heuristic_extract_for_tool(user_msg, tool)
+    if call is None:
+        return None
     return {
-        "function_calls": [{"name": tool["name"], "arguments": args}],
+        "function_calls": [call],
+        "total_time_ms": 0,
+        "confidence": 0.3,
+        "source": "on-device (heuristic)",
+    }
+
+
+def _heuristic_extract_multi(messages, tools):
+    """Multi-tool heuristic extraction for hard (multi-call) cases.
+
+    Decomposes the user message, matches each segment to a tool, and extracts
+    parameters per segment. Returns combined function calls.
+    """
+    user_msg = " ".join(m["content"] for m in messages if m["role"] == "user")
+    msg_lower = user_msg.lower()
+
+    # Split on " and " and commas
+    parts = re.split(r'\band\b|,', msg_lower)
+    segments = [p.strip().strip('.') for p in parts if len(p.strip()) > 3]
+    if not segments:
+        return None
+
+    # Find the original-case version of each segment for name extraction
+    orig_parts = re.split(r'\band\b|,', user_msg)
+    orig_segments = [p.strip().strip('.') for p in orig_parts if len(p.strip()) > 3]
+
+    used_tools = set()
+    all_calls = []
+
+    for i, seg in enumerate(segments):
+        orig_seg = orig_segments[i] if i < len(orig_segments) else seg
+        scored = [(t, _heuristic_tool_score(seg, t)) for t in tools if t["name"] not in used_tools]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        if not scored or scored[0][1] <= 0:
+            continue
+        tool = scored[0][0]
+        # For recipient/name extraction, use full original message for context
+        call = _heuristic_extract_for_tool(orig_seg if any(c.isupper() for c in orig_seg) else user_msg, tool)
+        if call is not None:
+            all_calls.append(call)
+            used_tools.add(tool["name"])
+
+    if not all_calls:
+        return None
+
+    return {
+        "function_calls": all_calls,
         "total_time_ms": 0,
         "confidence": 0.3,
         "source": "on-device (heuristic)",
@@ -629,15 +705,20 @@ _LAST_RESORT_PROMPTS = [
 ]
 
 
-def _last_resort_local(messages, tools):
+def _last_resort_local(messages, tools, is_hard=False):
     """Last resort: run local without semantic checks, trying heuristic + model.
 
     Returns partial F1 > 0 vs nothing. Used when both validated-local and cloud
     fail. On eval servers without cloud access, this ensures we return something
     rather than F1=0.
     """
-    # For single-tool cases, heuristic extraction is more reliable than
-    # FunctionGemma's non-deterministic output
+    # For hard (multi-call) cases, use multi-tool heuristic first
+    if is_hard:
+        multi = _heuristic_extract_multi(messages, tools)
+        if multi is not None:
+            return multi
+
+    # For single-tool cases, heuristic extraction is more reliable
     if len(tools) == 1:
         heuristic = _heuristic_extract(messages, tools)
         if heuristic is not None:
@@ -653,7 +734,7 @@ def _last_resort_local(messages, tools):
             result["source"] = "on-device (last-resort)"
             return result
 
-    # Multi-tool heuristic fallback (less reliable but better than nothing)
+    # Single-tool heuristic fallback (for medium cases with multiple tools)
     if len(tools) > 1:
         heuristic = _heuristic_extract(messages, tools)
         if heuristic is not None:
@@ -662,7 +743,7 @@ def _last_resort_local(messages, tools):
     return {"function_calls": [], "total_time_ms": 0, "source": "on-device (empty)"}
 
 
-def _cloud_or_last_resort(messages, tools, local_time_extra=0):
+def _cloud_or_last_resort(messages, tools, local_time_extra=0, is_hard=False):
     """Try cloud, but if it returns nothing, fall back to raw local."""
     cloud = generate_cloud(messages, tools)
     if cloud.get("function_calls"):
@@ -672,7 +753,7 @@ def _cloud_or_last_resort(messages, tools, local_time_extra=0):
 
     # Cloud failed (no API key, network error, etc.)
     # Return raw local result — imperfect F1 > 0 beats F1=0
-    fallback = _last_resort_local(messages, tools)
+    fallback = _last_resort_local(messages, tools, is_hard=is_hard)
     fallback["total_time_ms"] += local_time_extra
     return fallback
 
@@ -750,7 +831,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         return merge_results(local_results, local_time)
 
     # Cloud fallback for entire original request, or last resort local
-    return _cloud_or_last_resort(messages, tools, local_time_extra=local_time)
+    return _cloud_or_last_resort(messages, tools, local_time_extra=local_time, is_hard=True)
 
 
 def print_result(label, result):
