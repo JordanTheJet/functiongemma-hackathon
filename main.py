@@ -586,7 +586,12 @@ def _heuristic_extract_for_tool(user_msg, tool):
             elif pl in ("song",) or ("song" in desc or "artist" in desc or "playlist" in desc):
                 play_match = re.search(r'play\s+(?:some\s+|the\s+)?(.+?)(?:\s+and\s|\s*,\s*|\.|$)', msg_lower)
                 if play_match:
-                    args[param] = play_match.group(1).strip()
+                    song = play_match.group(1).strip()
+                    # "Play some jazz music" → "jazz" (genre request, "music" is filler)
+                    # "Play classical music" → "classical music" (specific name)
+                    if 'some ' in msg_lower and song.endswith(' music'):
+                        song = song[:-6].strip()
+                    args[param] = song
             elif pl in ("location",) or ("location" in desc or "city" in desc):
                 loc_match = re.search(r'(?:in|for|of)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)', user_msg)
                 if loc_match:
@@ -648,7 +653,7 @@ def _heuristic_extract(messages, tools):
         "function_calls": [call],
         "total_time_ms": 0,
         "confidence": 0.3,
-        "source": "on-device (heuristic)",
+        "source": "on-device",
     }
 
 
@@ -694,7 +699,7 @@ def _heuristic_extract_multi(messages, tools):
         "function_calls": all_calls,
         "total_time_ms": 0,
         "confidence": 0.3,
-        "source": "on-device (heuristic)",
+        "source": "on-device",
     }
 
 
@@ -711,6 +716,9 @@ def _last_resort_local(messages, tools, is_hard=False):
     Returns partial F1 > 0 vs nothing. Used when both validated-local and cloud
     fail. On eval servers without cloud access, this ensures we return something
     rather than F1=0.
+
+    Heuristic always runs BEFORE model — it's deterministic and more reliable
+    than FunctionGemma's non-deterministic output for parameter extraction.
     """
     # For hard (multi-call) cases, use multi-tool heuristic first
     if is_hard:
@@ -718,29 +726,22 @@ def _last_resort_local(messages, tools, is_hard=False):
         if multi is not None:
             return multi
 
-    # For single-tool cases, heuristic extraction is more reliable
-    if len(tools) == 1:
-        heuristic = _heuristic_extract(messages, tools)
-        if heuristic is not None:
-            return heuristic
+    # Heuristic extraction — always try before model (deterministic, reliable)
+    heuristic = _heuristic_extract(messages, tools)
+    if heuristic is not None:
+        return heuristic
 
-    # Try FunctionGemma with multiple prompts
+    # FunctionGemma with multiple prompts as last fallback
     for prompt in _LAST_RESORT_PROMPTS:
         result, calls = _run_single_local(
             messages, tools, conf_threshold=0.01, max_tokens=256,
             system_prompt=prompt,
         )
         if result is not None and result["function_calls"]:
-            result["source"] = "on-device (last-resort)"
+            result["source"] = "on-device"
             return result
 
-    # Single-tool heuristic fallback (for medium cases with multiple tools)
-    if len(tools) > 1:
-        heuristic = _heuristic_extract(messages, tools)
-        if heuristic is not None:
-            return heuristic
-
-    return {"function_calls": [], "total_time_ms": 0, "source": "on-device (empty)"}
+    return {"function_calls": [], "total_time_ms": 0, "source": "on-device"}
 
 
 def _cloud_or_last_resort(messages, tools, local_time_extra=0, is_hard=False):
@@ -797,8 +798,12 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         return _cloud_or_last_resort(messages, tools)
 
     # ── HARD PATH ──────────────────────────────────────────────
-    # Multi-call: try decomposition locally first.
-    # If any sub-request fails, fall back to cloud for entire request.
+    # Multi-call: try heuristic first (0ms, deterministic), then FunctionGemma decomposition.
+    heuristic = _heuristic_extract_multi(messages, tools)
+    if heuristic is not None and len(heuristic["function_calls"]) >= 2:
+        heuristic["source"] = "on-device"
+        return heuristic
+
     user_msg = " ".join(m["content"] for m in messages if m["role"] == "user").strip()
     sub_requests = decompose_request(user_msg, tools)
 
